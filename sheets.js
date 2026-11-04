@@ -54,15 +54,77 @@ const SheetsAPI = (() => {
     _maybeReady();
   }
 
+  const STORAGE_KEY = 'ts_g_auth_token';
+  const LOGIN_FLAG_KEY = 'ts_g_has_logged_in';
+
+  function _saveToken(token, expiresInSec = 3599) {
+    accessToken = token;
+    if (gapiInited) {
+      gapi.client.setToken({ access_token: token });
+    }
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        token,
+        expires_at: Date.now() + (expiresInSec * 1000)
+      }));
+      localStorage.setItem(LOGIN_FLAG_KEY, 'true');
+    } catch (e) {
+      console.warn('Could not save auth token to localStorage', e);
+    }
+  }
+
+  function _loadValidStoredToken() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      // Give a 2-minute buffer before expiry
+      if (data && data.token && data.expires_at > (Date.now() + 120000)) {
+        return data.token;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function _clearStoredToken() {
+    accessToken = null;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(LOGIN_FLAG_KEY);
+    } catch (e) {}
+  }
+
   function _maybeReady() {
     if (gapiInited && gisInited) {
-      onAuthChange(false); // Both loaded; not yet signed in
+      const storedToken = _loadValidStoredToken();
+      if (storedToken) {
+        accessToken = storedToken;
+        gapi.client.setToken({ access_token: storedToken });
+        onAuthChange(true);
+      } else if (localStorage.getItem(LOGIN_FLAG_KEY) === 'true') {
+        // User logged in before: attempt silent token refresh without showing consent prompt
+        tokenClient.callback = (response) => {
+          if (response && !response.error && response.access_token) {
+            _saveToken(response.access_token, response.expires_in || 3599);
+            onAuthChange(true);
+          } else {
+            onAuthChange(false);
+          }
+        };
+        try {
+          tokenClient.requestAccessToken({ prompt: '' });
+        } catch (e) {
+          onAuthChange(false);
+        }
+      } else {
+        onAuthChange(false);
+      }
     }
   }
 
   // ── Auth ──────────────────────────────────────────────────
 
-  /** Opens the OAuth popup / consent screen. */
+  /** Opens the OAuth popup / signs in. */
   function signIn() {
     return new Promise((resolve, reject) => {
       tokenClient.callback = (response) => {
@@ -70,30 +132,31 @@ const SheetsAPI = (() => {
           reject(new Error(response.error));
           return;
         }
-        accessToken = response.access_token;
+        _saveToken(response.access_token, response.expires_in || 3599);
         onAuthChange(true);
         resolve(accessToken);
       };
 
-      if (accessToken) {
-        // Already have a token — just request new one silently if expired
-        tokenClient.requestAccessToken({ prompt: '' });
-      } else {
-        tokenClient.requestAccessToken({ prompt: 'consent' });
-      }
+      // prompt: '' will NOT re-prompt consent or show the unverified warning screen if already authorized!
+      tokenClient.requestAccessToken({ prompt: '' });
     });
   }
 
   /** Revokes the current token and signs out. */
   function signOut() {
     return new Promise((resolve) => {
-      if (!accessToken) { resolve(); return; }
-      google.accounts.oauth2.revoke(accessToken, () => {
-        accessToken = null;
-        gapi.client.setToken(null);
-        onAuthChange(false);
+      const oldToken = accessToken;
+      _clearStoredToken();
+      gapi.client.setToken(null);
+      onAuthChange(false);
+
+      if (oldToken) {
+        google.accounts.oauth2.revoke(oldToken, () => {
+          resolve();
+        });
+      } else {
         resolve();
-      });
+      }
     });
   }
 
