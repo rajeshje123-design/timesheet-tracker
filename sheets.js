@@ -29,6 +29,9 @@ const SheetsAPI = (() => {
 
   // ── Init ──────────────────────────────────────────────────
 
+  let gapiResolve;
+  const gapiReady = new Promise(resolve => { gapiResolve = resolve; });
+
   /**
    * Called by the gapi script's onload callback (gapiLoaded in index.html).
    * Initialises gapi.client with the Sheets discovery document.
@@ -38,6 +41,7 @@ const SheetsAPI = (() => {
       discoveryDocs: [CONFIG.DISCOVERY_DOC],
     });
     gapiInited = true;
+    if (gapiResolve) gapiResolve();
     _maybeReady();
   }
 
@@ -101,21 +105,6 @@ const SheetsAPI = (() => {
         accessToken = storedToken;
         gapi.client.setToken({ access_token: storedToken });
         onAuthChange(true);
-      } else if (localStorage.getItem(LOGIN_FLAG_KEY) === 'true') {
-        // User logged in before: attempt silent token refresh without showing consent prompt
-        tokenClient.callback = (response) => {
-          if (response && !response.error && response.access_token) {
-            _saveToken(response.access_token, response.expires_in || 3599);
-            onAuthChange(true);
-          } else {
-            onAuthChange(false);
-          }
-        };
-        try {
-          tokenClient.requestAccessToken({ prompt: '' });
-        } catch (e) {
-          onAuthChange(false);
-        }
       } else {
         onAuthChange(false);
       }
@@ -147,7 +136,9 @@ const SheetsAPI = (() => {
     return new Promise((resolve) => {
       const oldToken = accessToken;
       _clearStoredToken();
-      gapi.client.setToken(null);
+      if (gapiInited) {
+        gapi.client.setToken(null);
+      }
       onAuthChange(false);
 
       if (oldToken) {
@@ -162,13 +153,14 @@ const SheetsAPI = (() => {
 
   /** Returns true if we currently have an access token. */
   function isSignedIn() {
-    return !!accessToken;
+    return !!(accessToken || _loadValidStoredToken());
   }
 
   // ── Internal helpers ──────────────────────────────────────
 
   /** Makes sure gapi.client uses the latest access token. */
-  function _applyToken() {
+  async function _applyToken() {
+    await gapiReady;
     if (!accessToken) throw new Error('Not signed in.');
     gapi.client.setToken({ access_token: accessToken });
   }
@@ -185,7 +177,7 @@ const SheetsAPI = (() => {
    * Writes them if the sheet is empty or the first row is blank.
    */
   async function ensureHeaders() {
-    _applyToken();
+    await _applyToken();
     try {
       const res = await gapi.client.sheets.spreadsheets.values.get({
         spreadsheetId: CONFIG.SHEET_ID,
@@ -216,7 +208,7 @@ const SheetsAPI = (() => {
    *                  taskGroup, taskType, taskDescription, taskNature
    */
   async function appendRow(rowData) {
-    _applyToken();
+    await _applyToken();
     await ensureHeaders();
 
     const row = [
@@ -247,7 +239,7 @@ const SheetsAPI = (() => {
    * @returns {Array<Object>} Array of objects keyed by header name.
    */
   async function getAllRows() {
-    _applyToken();
+    await _applyToken();
     await ensureHeaders();
 
     const res = await gapi.client.sheets.spreadsheets.values.get({
@@ -278,7 +270,15 @@ const SheetsAPI = (() => {
     ensureHeaders,
     appendRow,
     getAllRows,
-    set onAuthChange(fn) { onAuthChange = fn; },
+    getStoredToken: _loadValidStoredToken,
+    set onAuthChange(fn) {
+      onAuthChange = fn;
+      const validToken = _loadValidStoredToken();
+      if (validToken) {
+        accessToken = validToken;
+        onAuthChange(true);
+      }
+    },
     get headers() { return [...HEADERS]; },
   };
 })();
